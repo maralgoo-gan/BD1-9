@@ -4,6 +4,8 @@ import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.util.List;
+import java.util.Objects;
+import java.text.ParseException;
 import java.util.Locale;
 import java.util.concurrent.RejectedExecutionException;
 
@@ -17,6 +19,7 @@ public final class ThreadPoolApp extends JFrame {
     private static final Color BLUE = new Color(45, 99, 215);
     private static final Color AMBER = new Color(214, 137, 25);
     private static final Color RED = new Color(207, 65, 75);
+    private static final Color CANCELLED = new Color(91, 103, 122);
     private static final Color BORDER = new Color(224, 230, 239);
 
     private final JSpinner workersSpinner = spinner(3, 1, 32, 1);
@@ -42,7 +45,7 @@ public final class ThreadPoolApp extends JFrame {
     private boolean resetting = false;
 
     public ThreadPoolApp() {
-        super("Урсгалын сан — Ажиллагчдын төлөв | Үйлдлийн систем БД1");
+        super("Урсгалын сан — Ажиллагчдын төлөв | Үйлдлийн систем БД2 Final");
         setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
         // Дэлгэцийн бодит хэмжээнд тохируулж цонхыг багтаана (Mac дээр ч ашигтай).
         Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
@@ -126,12 +129,19 @@ public final class ThreadPoolApp extends JFrame {
         center.setOpaque(false);
         content.add(center, BorderLayout.CENTER);
         JPanel chartCard = panel(new BorderLayout(0, 8));
-        chartCard.add(sectionTitle("АЖИЛЛАГЧДЫН ХУГАЦААНЫ ШУГАМ", "Ногоон: ажиллаж буй · Саарал: сул · Цэнхэр: дууссан агшин · Улаан: зогссон агшин"), BorderLayout.NORTH);
+        chartCard.add(sectionTitle("АЖИЛЛАГЧДЫН ХУГАЦААНЫ ШУГАМ", "Ажил бүрийн бодит эхлэх, дуусах хугацааны түүх (4000 event-ээс хамаарахгүй)"), BorderLayout.NORTH);
         JScrollPane timelineScroll = new JScrollPane(timeline);
         timelineScroll.setBorder(null);
         timelineScroll.getVerticalScrollBar().setUnitIncrement(16);
         chartCard.add(timelineScroll, BorderLayout.CENTER);
-        chartCard.add(runtimeLabel, BorderLayout.SOUTH);
+        JPanel belowChart = new JPanel(new BorderLayout(0, 3));
+        belowChart.setOpaque(false);
+        JLabel legend = new JLabel("● Ногоон: ажил  |  ● Цэнхэр: дууссан  |  ● Шар: алдаа  |  ● Саарал: цуцалсан  |  ● Улаан: зогссон");
+        legend.setFont(new Font("SansSerif", Font.PLAIN, 10));
+        legend.setForeground(SUBTEXT);
+        belowChart.add(legend, BorderLayout.NORTH);
+        belowChart.add(runtimeLabel, BorderLayout.SOUTH);
+        chartCard.add(belowChart, BorderLayout.SOUTH);
         chartCard.setPreferredSize(new Dimension(600, 285));
         center.add(chartCard, BorderLayout.NORTH);
 
@@ -211,14 +221,16 @@ public final class ThreadPoolApp extends JFrame {
         resetButton.addActionListener(e -> resetPool());
         enableButtons();
         renderWorkers(null);
-        new javax.swing.Timer(180, e -> {
+        // One UI update per 150 ms, not one queued Swing callback per task event.
+        new javax.swing.Timer(150, e -> {
             ThreadPool p = activePool;
-            if (p != null) {
-                current = p.getSnapshot();
-                timeline.setSnapshot(current);
-                runtimeLabel.setText(String.format(Locale.US, "Өнгөрсөн: %.1f сек · Дарааллын багтаамж: %d",
-                    TimelinePanel.displayTimeMillis(current) / 1000.0, current.queueCapacity));
-            }
+            if (p == null) return;
+            ThreadPool.Snapshot next = p.getSnapshot();
+            if (current == null || next.revision != current.revision) applySnapshot(next);
+            else timeline.setSnapshot(next); // active RUNNING bars need the current time
+            runtimeLabel.setText(String.format(Locale.US,
+                "Өнгөрсөн: %.1f сек · Дарааллын багтаамж: %d",
+                TimelinePanel.displayTimeMillis(next) / 1000.0, next.queueCapacity));
         }).start();
         addWindowListener(new java.awt.event.WindowAdapter() {
             @Override public void windowClosing(java.awt.event.WindowEvent e) {
@@ -233,23 +245,32 @@ public final class ThreadPoolApp extends JFrame {
     private void startPool() {
         if (activePool != null || resetting) return;
         try {
+            workersSpinner.commitEdit();
+            capacitySpinner.commitEdit();
             int count = (Integer) workersSpinner.getValue();
             int cap = (Integer) capacitySpinner.getValue();
             ThreadPool created = new ThreadPool(count, cap);
             activePool = created;
-            created.setListener(s -> SwingUtilities.invokeLater(() -> {
-                if (activePool == created) applySnapshot(s);
-            }));
+            applySnapshot(created.getSnapshot());
             status.setText("Сан үүсгэлээ: " + count + " ажиллагч, дарааллын багтаамж " + cap + ". Одоо «Ажил нэмэх» товчийг дарна уу.");
             enableButtons();
-        } catch (RuntimeException ex) { showError(ex.getMessage()); }
+        } catch (ParseException ex) { showError("Тохиргооны тоон утга буруу байна"); }
+        catch (RuntimeException ex) { showError(ex.getMessage()); }
     }
 
     private void addBatch() {
         ThreadPool p = activePool;
         if (p == null || resetting) return;
-        int count = (Integer) batchSpinner.getValue();
-        int duration = (Integer) durationSpinner.getValue();
+        int count, duration;
+        try {
+            batchSpinner.commitEdit();
+            durationSpinner.commitEdit();
+            count = (Integer) batchSpinner.getValue();
+            duration = (Integer) durationSpinner.getValue();
+        } catch (ParseException ex) {
+            showError("Ажлын тоо эсвэл хугацааны утга буруу байна");
+            return;
+        }
         int modeIndex = modeBox.getSelectedIndex();
         WorkTask.Mode mode = WorkTask.Mode.values()[modeIndex];
         int accepted = 0;
@@ -271,6 +292,7 @@ public final class ThreadPoolApp extends JFrame {
         ThreadPool p = activePool;
         if (p == null || resetting) return;
         p.shutdown();
+        applySnapshot(p.getSnapshot());
         status.setText("Зогсоох хүсэлт авлаа. Хүлээж буй ажлыг цуцалж, ажиллагчдыг тасалдууллаа. Шинээр эхлэх бол «Шинэчлэх» дар.");
         enableButtons();
     }
@@ -323,14 +345,20 @@ public final class ThreadPoolApp extends JFrame {
         for (int i = 0; i < counts.length; i++) metricValues[i].setText(String.valueOf(counts[i]));
         queueModel.clear();
         for (Integer id : snapshot.queueTaskIds) queueModel.addElement("T" + id + "  •  ХҮЛЭЭЖ БАЙНА");
-        tableModel.setRowCount(0);
+        // Preserve rows. Only append new jobs and mutate actually changed cells.
+        // Rebuilding thousands of JTable rows on every event caused UI freezes (P8).
         for (ThreadPool.TaskView task : snapshot.tasks) {
-            tableModel.addRow(new Object[]{
+            Object[] row = {
                 "T" + task.id, task.label, taskStateText(task.state),
                 task.workerId < 0 ? "—" : "W" + task.workerId,
                 task.startMillis < 0 ? "—" : seconds(task.startMillis),
                 task.finishMillis < 0 ? "—" : seconds(task.finishMillis)
-            });
+            };
+            int index = task.id - 1; // IDs are monotonic and never deleted in this pool.
+            if (index >= tableModel.getRowCount()) tableModel.addRow(row);
+            else for (int col = 0; col < row.length; col++)
+                if (!Objects.equals(tableModel.getValueAt(index, col), row[col]))
+                    tableModel.setValueAt(row[col], index, col);
         }
         StringBuilder logs = new StringBuilder();
         List<ThreadPool.Event> events = snapshot.events;
@@ -383,7 +411,7 @@ public final class ThreadPoolApp extends JFrame {
     }
 
     private void enableButtons() {
-        boolean running = activePool != null && !activePool.getSnapshot().shuttingDown;
+        boolean running = activePool != null && current != null && !current.shuttingDown;
         startButton.setEnabled(!resetting && activePool == null);
         addButton.setEnabled(!resetting && running);
         stopButton.setEnabled(!resetting && running);
@@ -481,21 +509,24 @@ public final class ThreadPoolApp extends JFrame {
             label.setFont(label.getFont().deriveFont(Font.BOLD));
             if (!selected) label.setForeground("ДУУССАН".equals(val) ? GREEN :
                 "АЖИЛЛАЖ БУЙ".equals(val) ? BLUE :
-                "АЛДААТАЙ".equals(val) || "ЦУЦЛАГДСАН".equals(val) ? RED : SUBTEXT);
+                "АЛДААТАЙ".equals(val) ? AMBER :
+                "ЦУЦЛАГДСАН".equals(val) ? CANCELLED : SUBTEXT);
             return label;
         }
     }
 
-    /** Бодит event-үүдээр зурдаг хугацааны шугам. STOPPED нь үргэлжилсэн төлөв биш, агшин юм. */
+    /**
+     * True task timeline. The recent log is capped at 4000 entries, but the
+     * complete TaskView list stores every start/finish interval and is used here.
+     * No fake IDLE sections when old log entries are evicted (P4).
+     */
     static final class TimelinePanel extends JPanel {
-        /** Зогссон сангийн цагийн хуваарийг STOPPED агшинд нь царцаана. */
         static long displayTimeMillis(ThreadPool.Snapshot snap) {
             if (snap == null) return 0;
             if (!snap.terminated) return snap.elapsedMillis;
             long stoppedAt = -1;
-            for (ThreadPool.Event ev : snap.events) {
-                if ("STOPPED".equals(ev.kind)) stoppedAt = Math.max(stoppedAt, ev.timeMillis);
-            }
+            for (ThreadPool.WorkerView worker : snap.workers)
+                stoppedAt = Math.max(stoppedAt, worker.stoppedMillis);
             return stoppedAt >= 0 ? stoppedAt : snap.elapsedMillis;
         }
 
@@ -536,68 +567,56 @@ public final class ThreadPoolApp extends JFrame {
                 c.setColor(new Color(230, 235, 242));
                 c.drawLine(x, top, x, top + Math.max(workerCount, 1) * row + 8);
                 c.setColor(SUBTEXT);
-                c.drawString(String.format(Locale.US, "%.1f сек", maxMs * tick / 4000.0), x - 4,
-                             top + Math.max(workerCount, 1) * row + 22);
+                String label = String.format(Locale.US, "%.1f сек", maxMs * tick / 4000.0);
+                int desiredX = x - (tick == 4 ? c.getFontMetrics().stringWidth(label) : 4);
+                int safeX = Math.max(2, Math.min(getWidth() - c.getFontMetrics().stringWidth(label) - 2, desiredX));
+                c.drawString(label, safeX, top + Math.max(workerCount, 1) * row + 22);
             }
-            for (int w = 1; w <= workerCount; w++) {
-                int y = top + (w - 1) * row;
+            // Draw idle background only up to worker STOPPED; no colored duration after stop.
+            for (ThreadPool.WorkerView worker : snap.workers) {
+                int y = top + (worker.id - 1) * row;
                 c.setFont(new Font("SansSerif", Font.BOLD, 11));
                 c.setColor(NAVY);
-                c.drawString("W" + w, 15, y + 18);
-                c.setColor(new Color(232, 235, 240));
-                c.fillRoundRect(left, y + 4, graphWidth, 20, 5, 5);
-                String previous = "IDLE";
-                long previousTime = 0;
-                long stoppedAt = -1;
-                for (ThreadPool.Event ev : snap.events) {
-                    if (ev.workerId != w) continue;
-                    if (ev.kind.equals("RUNNING") || ev.kind.equals("IDLE") || ev.kind.equals("STOPPED")) {
-                        // Өмнөх төлөвийг ЗӨВХӨН дараагийн бодит event хүртэл зурна.
-                        paintState(c, previous, left, graphWidth, y, maxMs, previousTime, ev.timeMillis);
-                        if (ev.kind.equals("STOPPED")) {
-                            stoppedAt = ev.timeMillis;
-                            break; // STOPPED -> цааш үргэлжлэх улаан зурвас БАЙХГҮЙ.
-                        }
-                        previous = ev.kind;
-                        previousTime = ev.timeMillis;
-                    }
-                }
-                if (stoppedAt < 0) {
-                    paintState(c, previous, left, graphWidth, y, maxMs, previousTime, displayMs);
-                }
-                // Амжилттай дууссан task-ийн агшныг тод цэнхэр тэмдэглэгээгээр ялгана.
-                for (ThreadPool.Event ev : snap.events) {
-                    if (ev.workerId != w) continue;
-                    if (ev.kind.equals("COMPLETED") || ev.kind.equals("FAILED") || ev.kind.equals("CANCELLED")) {
-                        int x = xAt(left, graphWidth, maxMs, ev.timeMillis);
-                        c.setColor(ev.kind.equals("COMPLETED") ? BLUE : RED);
-                        c.fillRoundRect(x - 3, y + 2, 6, 24, 3, 3);
-                        c.setColor(Color.WHITE);
-                        c.fillOval(x - 1, y + 10, 2, 5);
-                    }
-                }
-                // Worker зогссон үйл явдлыг ганц нарийн улаан босоо зураасаар тэмдэглэнэ.
-                if (stoppedAt >= 0) {
-                    int x = xAt(left, graphWidth, maxMs, stoppedAt);
-                    c.setColor(RED);
-                    c.fillRoundRect(x - 2, y + 2, 4, 24, 2, 2);
-                    c.fillOval(x - 4, y + 1, 8, 8);
-                }
+                c.drawString("W" + worker.id, 15, y + 18);
+                long until = worker.stoppedMillis >= 0 ? worker.stoppedMillis : displayMs;
+                paintInterval(c, new Color(176, 185, 197), left, graphWidth,
+                              y, maxMs, 0, until);
+            }
+            // Each job is painted once. Neither list trimming nor event count affects this.
+            for (ThreadPool.TaskView task : snap.tasks) {
+                if (task.workerId < 1 || task.startMillis < 0) continue;
+                int y = top + (task.workerId - 1) * row;
+                long finish = task.finishMillis < 0 ? displayMs : task.finishMillis;
+                paintInterval(c, GREEN, left, graphWidth, y, maxMs, task.startMillis, finish);
+                if (task.finishMillis < 0) continue;
+                int x = xAt(left, graphWidth, maxMs, task.finishMillis);
+                c.setColor(task.state == ThreadPool.TaskState.COMPLETED ? BLUE :
+                    task.state == ThreadPool.TaskState.FAILED ? AMBER : CANCELLED);
+                c.fillRoundRect(x - 3, y + 2, 6, 24, 3, 3);
+                c.setColor(Color.WHITE);
+                c.fillOval(x - 1, y + 10, 2, 5);
+            }
+            for (ThreadPool.WorkerView worker : snap.workers) {
+                if (worker.stoppedMillis < 0) continue;
+                int y = top + (worker.id - 1) * row;
+                int x = xAt(left, graphWidth, maxMs, worker.stoppedMillis);
+                c.setColor(RED);
+                c.fillRoundRect(x - 2, y + 2, 4, 24, 2, 2);
+                c.fillOval(x - 4, y + 1, 8, 8);
             }
             c.dispose();
         }
         private static int xAt(int left, int width, long max, long time) {
             return left + (int) (width * Math.min(max, Math.max(0, time)) / (double) max);
         }
-        private static void paintState(Graphics2D g, String state, int left, int width,
-                                       int y, long max, long from, long to) {
+        private static void paintInterval(Graphics2D g, Color color,
+                int left, int width, int y, long max, long from, long to) {
             if (to < from) return;
             int x1 = xAt(left, width, max, from);
             int x2 = xAt(left, width, max, to);
-            // STOPPED-ийг paintState-ээр хэзээ ч үргэлжилсэн зурвас болгож зурахгүй.
-            if (state.equals("STOPPED")) return;
-            g.setColor(state.equals("RUNNING") ? GREEN : new Color(176, 185, 197));
+            g.setColor(color);
             g.fillRoundRect(x1, y + 5, Math.max(1, x2 - x1), 18, 4, 4);
         }
     }
+
 }

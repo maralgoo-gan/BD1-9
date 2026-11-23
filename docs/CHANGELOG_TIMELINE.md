@@ -7,7 +7,7 @@
 ## Шийдэл
 
 1. `STOPPED` нь төгсгөлийн агшин: тасралтгүй улаан зурвас бус ганц босоо улаан тэмдэг зурна.
-2. Pool-ийн бүх worker зогсвол сүүлийн `STOPPED` event-ийн хугацаагаар UI цаг болон Timeline scale-ийг царцаана.
+2. Pool-ийн бүх worker зогсвол `WorkerView.stoppedMillis`-ийн хамгийн сүүлчийн хугацаагаар UI цаг болон Timeline scale-ийг царцаана.
 3. `COMPLETED` event бүрийг тод цэнхэр босоо тэмдэг болгов. Worker дараагийн ажилд `IDLE` болж буцна.
 4. `TimelineTests` нь 500 мс өнгөрөхөд image болон хугацааны scale өөрчлөгдөхгүй, улаан суналт үгүй, цэнхэр тэмдэг байгаа эсэхийг автоматаар шалгана.
 5. `worker-activity-stopped-fixed.png` нь Linux/Xvfb дээр бичилт хийж авсан бодит GUI screenshot.
@@ -21,3 +21,7 @@ java -Dfile.encoding=UTF-8 -cp out GuiSmokeTest
 ```
 
 Дараахыг Mac дээр нь дахин шалгаж, тайландаа бодит туршилтын орчин болон гаралтыг бичнэ.
+
+## БД2 нэмэлт засвар (2026-11-22)
+
+P4: timeline нь 4000 event-ийн bounded log-оос салж, бүх ажлын `TaskView.startMillis/finishMillis` дээр тулгуурласан. P5: FAILED=шар, CANCELLED=саарал, STOPPED=улаан, COMPLETED=цэнхэр. P8: 150 мс polling, event `ArrayDeque`, listener lock-ийн гадна, хүснэгтийн incremental update. Нотолгоо: `BD2_TEST_RESULTS.md` ба `TimelineBeforeAfterProbe.java`.

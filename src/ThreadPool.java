@@ -12,8 +12,8 @@ import java.util.concurrent.TimeUnit;
  * Chapter 7, Programming Project 1. Deliberately does not use ExecutorService.
  *
  * The task queue, worker states, and task transitions are guarded by ONE lock.
- * Listener callbacks receive immutable snapshots; the Swing listener posts
- * those snapshots to the Event Dispatch Thread.
+ * The UI polls an immutable snapshot approximately every 150 ms (not per task).
+ * Optional listener callbacks run outside the pool lock and are rate-limited.
  */
 public final class ThreadPool {
     public enum TaskState { QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED }
@@ -52,9 +52,13 @@ public final class ThreadPool {
         public final int currentTaskId;
         public final int completedTasks;
         public final String lastResult;
-        private WorkerView(int id, WorkerState state, int taskId, int count, String lastResult) {
+        /** Exact STOPPED timestamp, retained even when the 4000-entry log rotates. */
+        public final long stoppedMillis;
+        private WorkerView(int id, WorkerState state, int taskId, int count,
+                           String lastResult, long stoppedMillis) {
             this.id = id; this.state = state; this.currentTaskId = taskId;
             this.completedTasks = count; this.lastResult = lastResult;
+            this.stoppedMillis = stoppedMillis;
         }
     }
 
@@ -79,11 +83,12 @@ public final class ThreadPool {
         public final int submitted, queued, running, completed, failed, cancelled;
         public final boolean shuttingDown, terminated;
         public final long elapsedMillis;
+        public final long revision;
         private Snapshot(List<TaskView> tasks, List<WorkerView> workers,
                          List<Event> events, List<Integer> queueIds,
                          int cap, int submitted, int queued, int running,
                          int completed, int failed, int cancelled,
-                         boolean shuttingDown, boolean terminated, long elapsedMillis) {
+                         boolean shuttingDown, boolean terminated, long elapsedMillis, long revision) {
             this.tasks = Collections.unmodifiableList(tasks);
             this.workers = Collections.unmodifiableList(workers);
             this.events = Collections.unmodifiableList(events);
@@ -92,7 +97,7 @@ public final class ThreadPool {
             this.submitted = submitted; this.queued = queued; this.running = running;
             this.completed = completed; this.failed = failed; this.cancelled = cancelled;
             this.shuttingDown = shuttingDown; this.terminated = terminated;
-            this.elapsedMillis = elapsedMillis;
+            this.elapsedMillis = elapsedMillis; this.revision = revision;
         }
     }
 
@@ -122,18 +127,23 @@ public final class ThreadPool {
     private final Object lock = new Object();
     private final ArrayDeque<Job> queue = new ArrayDeque<>();
     private final Map<Integer, Job> allTasks = new LinkedHashMap<>();
-    private final ArrayList<Event> events = new ArrayList<>();
+    /** Recent event log only; timeline never depends on these rotating entries. */
+    private final ArrayDeque<Event> events = new ArrayDeque<>();
     private final Thread[] threads;
     private final WorkerState[] workerStates;
     private final int[] activeTaskIds;
     private final int[] workerCompleted;
     private final String[] lastResults;
+    private final long[] workerStoppedMillis;
     private final int queueCapacity;
     private final long startNanos = System.nanoTime();
     private volatile boolean shuttingDown;
     private int nextTaskId = 1;
     private int stoppedCount = 0;
     private Listener listener;
+    private long revision = 0;
+    private long lastPublishedNanos = 0;
+    private static final long PUBLISH_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
 
     public ThreadPool() { this(3, 100); }
     public ThreadPool(int size) { this(size, 100); }
@@ -147,9 +157,11 @@ public final class ThreadPool {
         this.activeTaskIds = new int[size];
         this.workerCompleted = new int[size];
         this.lastResults = new String[size];
+        this.workerStoppedMillis = new long[size];
         for (int i = 0; i < size; i++) {
             workerStates[i] = WorkerState.IDLE;
             lastResults[i] = "—";
+            workerStoppedMillis[i] = -1;
             logLocked(i + 1, -1, "IDLE", "Ажиллагч ажил авахад бэлэн");
         }
         for (int i = 0; i < size; i++) {
@@ -163,8 +175,9 @@ public final class ThreadPool {
     public void setListener(Listener newListener) {
         synchronized (lock) {
             listener = newListener;
-            publishLocked();
+            lastPublishedNanos = 0;
         }
+        publishUpdate(true);
     }
 
     /** Book API: submit a Runnable to the pool. */
@@ -173,6 +186,7 @@ public final class ThreadPool {
     /** Extra API for the GUI: returns the assigned task ID. */
     public int submit(Runnable task) {
         if (task == null) throw new IllegalArgumentException("Ажил хоосон (null) байж болохгүй");
+        int id;
         synchronized (lock) {
             if (shuttingDown) throw new RejectedExecutionException("Урсгалын сан зогсож байгаа тул ажил нэмж болохгүй");
             if (queue.size() >= queueCapacity)
@@ -182,9 +196,10 @@ public final class ThreadPool {
             queue.addLast(job);
             logLocked(-1, job.id, "QUEUED", job.label);
             lock.notifyAll();
-            publishLocked();
-            return job.id;
+            id = job.id;
         }
+        publishUpdate(false);
+        return id;
     }
 
     /** Book API: interrupts workers and cancels tasks that have not started. */
@@ -201,9 +216,9 @@ public final class ThreadPool {
             }
             logLocked(-1, -1, "SHUTDOWN", "Ажиллагч урсгалуудад interrupt дохио илгээлээ");
             lock.notifyAll();
-            publishLocked();
         }
         for (Thread t : threads) t.interrupt();
+        publishUpdate(true);
     }
 
     /** Extra API for tests/reset. Never call this on the Swing UI thread. */
@@ -243,8 +258,8 @@ public final class ThreadPool {
                     workerStates[index] = WorkerState.RUNNING;
                     activeTaskIds[index] = job.id;
                     logLocked(workerId, job.id, "RUNNING", "Ажил эхэллээ");
-                    publishLocked();
                 }
+                publishUpdate(false);
                 TaskState result = TaskState.COMPLETED;
                 String error = "";
                 try {
@@ -274,8 +289,8 @@ public final class ThreadPool {
                     workerStates[index] = WorkerState.IDLE;
                     activeTaskIds[index] = 0;
                     logLocked(workerId, -1, "IDLE", "Дараагийн ажлыг хүлээж байна");
-                    publishLocked();
                 }
+                publishUpdate(false);
                 if (Thread.currentThread().isInterrupted()) break;
             }
         } catch (InterruptedException ignored) {
@@ -286,9 +301,10 @@ public final class ThreadPool {
                 workerStates[index] = WorkerState.STOPPED;
                 activeTaskIds[index] = 0;
                 stoppedCount++;
+                workerStoppedMillis[index] = elapsedMillis();
                 logLocked(workerId, -1, "STOPPED", "Ажиллагч урсгал зогслоо");
-                publishLocked();
             }
+            publishUpdate(true);
         }
     }
 
@@ -308,8 +324,9 @@ public final class ThreadPool {
 
     private void logLocked(int worker, int task, String kind, String detail) {
         // Call only while holding lock, or from constructor before threads start.
-        events.add(new Event(elapsedMillis(), worker, task, kind, detail));
-        if (events.size() > 4000) events.remove(0);
+        events.addLast(new Event(elapsedMillis(), worker, task, kind, detail));
+        if (events.size() > 4000) events.removeFirst();
+        revision++;
     }
 
     private Snapshot snapshotLocked() {
@@ -330,20 +347,28 @@ public final class ThreadPool {
         List<WorkerView> workers = new ArrayList<>(threads.length);
         for (int i = 0; i < threads.length; i++)
             workers.add(new WorkerView(i + 1, workerStates[i], activeTaskIds[i],
-                                       workerCompleted[i], lastResults[i]));
+                                       workerCompleted[i], lastResults[i], workerStoppedMillis[i]));
         return new Snapshot(tasks, workers, new ArrayList<>(events), pending,
                             queueCapacity, allTasks.size(), queue.size(), running,
                             completed, failed, cancelled,
                             shuttingDown, shuttingDown && stoppedCount == threads.length,
-                            elapsedMillis());
+                            elapsedMillis(), revision);
     }
 
-    private void publishLocked() {
-        if (listener == null) return;
-        try {
-            // The listener is invoked serially under the lock. It MUST only enqueue
-            // UI work, not synchronously modify the pool.
-            listener.onUpdate(snapshotLocked());
-        } catch (RuntimeException ignored) { /* UI listener cannot terminate workers */ }
+    /** Optional API: never invoke user-supplied code while holding the pool lock. */
+    private void publishUpdate(boolean force) {
+        Listener callback;
+        Snapshot snapshot;
+        synchronized (lock) {
+            callback = listener;
+            if (callback == null) return;
+            long now = System.nanoTime();
+            if (!force && lastPublishedNanos != 0
+                    && now - lastPublishedNanos < PUBLISH_INTERVAL_NANOS) return;
+            lastPublishedNanos = now;
+            snapshot = snapshotLocked();
+        }
+        try { callback.onUpdate(snapshot); }
+        catch (RuntimeException ignored) { /* A subscriber cannot terminate workers. */ }
     }
 }
